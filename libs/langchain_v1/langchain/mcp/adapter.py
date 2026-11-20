@@ -30,6 +30,8 @@ if TYPE_CHECKING:
     # `CacheMode` is the MCP SDK's own type (SEP-2549); FastMCP re-imports it
     # rather than defining its own, so this is the canonical source.
     from mcp.client.caching import CacheMode
+
+    from langchain.mcp.tools import MCPCallMeta
 else:
     try:
         from fastmcp import FastMCP
@@ -155,9 +157,15 @@ class MCPAdapter:
     client with no handler is armed, and it is cloned first so the caller's own
     object is never mutated.
 
+    Request `_meta` for each tool call (an idempotency key, or a tenant or trace
+    id the model must not see) is supplied by a `call_meta` hook, which every
+    tool the adapter builds calls once per invocation. See `as_langchain_tool`.
+
     Args:
         target: MCP target accepted by `fastmcp.Client`, including an existing
             FastMCP client. A `str` must be an `http`/`https` URL.
+        call_meta: Optional hook returning the request `_meta` to send with each
+            tool call. `None` (the default) sends no extra `_meta`.
 
     Example:
         ```python
@@ -170,7 +178,7 @@ class MCPAdapter:
         ```
     """
 
-    def __init__(self, target: MCPAdapterTarget) -> None:
+    def __init__(self, target: MCPAdapterTarget, *, call_meta: MCPCallMeta | None = None) -> None:
         """Initialize the adapter around a FastMCP target, client, or group.
 
         Each underlying client is armed to answer elicitation with an interrupt,
@@ -197,6 +205,7 @@ class MCPAdapter:
             client = FastMCPClient(target)
             _arm_for_interrupts(client)
             self._client = client
+        self._call_meta = call_meta
 
     @property
     def client(self) -> FastMCPClient[Any] | ClientGroup:
@@ -238,7 +247,10 @@ class MCPAdapter:
         """
         async with self:
             remote_tools = await self._client.list_tools(cache_mode=cache_mode)
-            return [await as_langchain_tool(tool, self._client) for tool in remote_tools]
+            return [
+                await as_langchain_tool(tool, self._client, call_meta=self._call_meta)
+                for tool in remote_tools
+            ]
 
 
 __all__ = ["MCPAdapter", "MCPAdapterTarget"]
