@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import ANY
 
 import pytest
-from fastmcp import Client, FastMCP
+from fastmcp import Client, Context, FastMCP
 from fastmcp.client.group import ClientGroup
 from fastmcp.client.transports import (
     FastMCPTransport,
@@ -20,7 +20,7 @@ from fastmcp.client.transports.config import MCPConfigTransport
 from langchain_core.messages import ToolMessage
 
 from langchain.agents import create_agent
-from langchain.mcp import MCPAdapter
+from langchain.mcp import MCPAdapter, MCPToolInvocation
 from tests.unit_tests.agents.model import FakeToolCallingModel
 
 if TYPE_CHECKING:
@@ -587,3 +587,49 @@ async def test_tools_from_both_protocol_eras_combine_into_one_agent() -> None:
         _tool_text(message) for message in result["messages"] if isinstance(message, ToolMessage)
     }
     assert answered == {"old", "-7"}
+
+
+@pytest.mark.asyncio
+async def test_call_meta_gives_each_parallel_agent_call_its_own_meta() -> None:
+    server: FastMCP[None] = FastMCP("orders")
+
+    @server.tool
+    def place_order(item: str, ctx: Context) -> dict[str, Any]:  # noqa: ARG001
+        """Place an order and report the request `_meta` it arrived with."""
+        assert ctx.request_context is not None
+        meta = ctx.request_context.meta or {}
+        return {key: value for key, value in meta.items() if key.startswith("com.example/")}
+
+    def call_meta(call: MCPToolInvocation) -> dict[str, Any]:
+        return {
+            "com.example/idempotency-key": call.tool_call_id,
+            "com.example/tenant": call.config["configurable"]["tenant"],
+        }
+
+    agent = create_agent(
+        FakeToolCallingModel(
+            tool_calls=[
+                [
+                    {"name": "place_order", "args": {"item": "tea"}, "id": "call-a"},
+                    {"name": "place_order", "args": {"item": "cake"}, "id": "call-b"},
+                ],
+                [],
+            ]
+        ),
+        await MCPAdapter(server, call_meta=call_meta).list_tools(),
+    )
+
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": "Order tea and cake."}]},
+        {"configurable": {"tenant": "acme"}},
+    )
+
+    sent = {
+        message.tool_call_id: message.artifact["structured_content"]
+        for message in result["messages"]
+        if isinstance(message, ToolMessage)
+    }
+    assert sent == {
+        "call-a": {"com.example/idempotency-key": "call-a", "com.example/tenant": "acme"},
+        "call-b": {"com.example/idempotency-key": "call-b", "com.example/tenant": "acme"},
+    }

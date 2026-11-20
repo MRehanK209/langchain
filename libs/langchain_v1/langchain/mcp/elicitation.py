@@ -17,7 +17,17 @@ refused rather than half-served.
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypeAlias, TypedDict, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Literal,
+    NotRequired,
+    TypeAlias,
+    TypedDict,
+    TypeVar,
+    cast,
+)
 
 from fastmcp.client.group import ClientGroup
 from langgraph.types import interrupt
@@ -36,7 +46,7 @@ if TYPE_CHECKING:
 
     from fastmcp.client import Client
     from mcp.client.session import ClientSession
-    from mcp.types import InputRequest
+    from mcp.types import InputRequest, RequestParamsMeta
 
 
 _ResultT = TypeVar("_ResultT")
@@ -312,6 +322,8 @@ async def _call_tool_with_interrupts(
     client: Client[Any] | ClientGroup,
     tool_name: str,
     arguments: dict[str, Any],
+    *,
+    meta: dict[str, Any] | None = None,
 ) -> CallToolResult:
     """Call an MCP tool, answering each round of requested input with an interrupt.
 
@@ -323,6 +335,8 @@ async def _call_tool_with_interrupts(
         client: A connected client armed to advertise the elicitation capability.
         tool_name: The MCP tool to call.
         arguments: Arguments for the tool.
+        meta: Request `_meta` to send on every round of the call, so a server
+            sees the same request metadata on the answered round as on the first.
 
     Returns:
         The tool's terminal result.
@@ -338,9 +352,12 @@ async def _call_tool_with_interrupts(
     # drive it against the member session, whose `call_tool` still returns the
     # `InputRequiredResult` for us to answer.
     member, session, upstream_name = await _resolve_session(client, tool_name)
+    # `RequestParamsMeta` is an open TypedDict, so any string-keyed dict is one.
+    request_meta = cast("RequestParamsMeta | None", meta)
 
     result = await _await_monitored(
-        member, session.call_tool(upstream_name, arguments, allow_input_required=True)
+        member,
+        session.call_tool(upstream_name, arguments, meta=request_meta, allow_input_required=True),
     )
 
     while isinstance(result, InputRequiredResult):
@@ -371,6 +388,7 @@ async def _call_tool_with_interrupts(
                 arguments,
                 input_responses=responses,
                 request_state=result.request_state,  # opaque; echoed back verbatim
+                meta=request_meta,
                 allow_input_required=True,
             ),
         )

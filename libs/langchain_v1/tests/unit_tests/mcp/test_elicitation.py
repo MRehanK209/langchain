@@ -13,6 +13,7 @@ from fastmcp import Client, Context, FastMCP
 from fastmcp.client.group import ClientGroup
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
+from mcp.server.mcpserver import Context as MCPServerContext
 from mcp.server.mcpserver import Elicit, MCPServer, Resolve
 from mcp.types import (
     CallToolResult,
@@ -28,7 +29,7 @@ from mcp.types import (
 from pydantic import BaseModel
 
 from langchain.agents import create_agent
-from langchain.mcp import MCPAdapter
+from langchain.mcp import MCPAdapter, MCPToolInvocation
 from langchain.mcp.elicitation import (
     _arm_for_interrupts,
     _call_tool_with_interrupts,
@@ -571,3 +572,50 @@ async def test_an_unknown_action_is_rejected() -> None:
     bogus = {"responses": {question["key"]: {"action": "maybe"}}}
     with pytest.raises(ValueError, match="expected 'accept', 'decline', or 'cancel'"):
         await agent.ainvoke(Command(resume=bogus), config)
+
+
+@pytest.mark.asyncio
+async def test_call_meta_is_sent_on_every_round_and_is_stable_across_the_resume() -> None:
+    """A resumed call re-runs the hook, with the same tool call id as before."""
+    server = MCPServer("restaurant")
+    seen_by_server: list[dict[str, Any]] = []
+
+    def _sent(ctx: MCPServerContext) -> dict[str, Any]:
+        meta = ctx.request_context.meta or {}
+        return {key: value for key, value in meta.items() if key.startswith("com.example/")}
+
+    def ask_party_size(ctx: MCPServerContext) -> Elicit[PartySize]:
+        seen_by_server.append(_sent(ctx))
+        return Elicit("How many guests are dining?", PartySize)
+
+    @server.tool()
+    def book_table(
+        party: Annotated[PartySize, Resolve(ask_party_size)], ctx: MCPServerContext
+    ) -> str:
+        """Book a table."""
+        seen_by_server.append(_sent(ctx))
+        return f"Booked a table for {party.guests}."
+
+    hook_calls: list[str | None] = []
+
+    def call_meta(call: MCPToolInvocation) -> dict[str, Any]:
+        hook_calls.append(call.tool_call_id)
+        return {"com.example/idempotency-key": call.tool_call_id}
+
+    agent = _agent(await MCPAdapter(server, call_meta=call_meta).list_tools())
+    config: Any = {"configurable": {"thread_id": "t"}}
+
+    paused = await agent.ainvoke({"messages": [{"role": "user", "content": "book"}]}, config)
+    [pause] = paused["__interrupt__"]
+    [question] = pause.value["requests"]
+    await agent.ainvoke(
+        Command(
+            resume={"responses": {question["key"]: {"action": "accept", "content": {"guests": 3}}}}
+        ),
+        config,
+    )
+
+    assert hook_calls == ["c1", "c1"]
+    # The question round and the answered round each reached the server.
+    assert len(seen_by_server) >= 2
+    assert all(sent == {"com.example/idempotency-key": "c1"} for sent in seen_by_server)

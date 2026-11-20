@@ -73,7 +73,9 @@ def test_the_public_names_survive_the_warning() -> None:
     """The warning must not become the module's only effect."""
     assert sorted(langchain.mcp.__all__) == [
         "MCPAdapter",
+        "MCPCallMeta",
         "MCPToolArtifact",
+        "MCPToolInvocation",
         "as_langchain_tool",
     ]
     for name in langchain.mcp.__all__:

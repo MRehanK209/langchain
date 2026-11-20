@@ -9,7 +9,12 @@ serving server's identity under `mcp.server`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol, TypedDict
+import inspect
+from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, TypedDict
 
 from fastmcp.client.group import ClientGroup
 from langchain_core.messages.content import (
@@ -20,6 +25,7 @@ from langchain_core.messages.content import (
     create_image_block,
     create_text_block,
 )
+from langchain_core.runnables import RunnableConfig, ensure_config
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
 from mcp.types import (
     AudioContent,
@@ -67,6 +73,96 @@ class MCPToolArtifact(TypedDict):
     """
 
     structured_content: Any
+
+
+@dataclass(frozen=True, kw_only=True)
+class MCPToolInvocation:
+    """One invocation of an MCP tool, as passed to a `call_meta` hook.
+
+    Attributes:
+        tool_name: The tool's name as LangChain sees it. For a `ClientGroup`
+            this is the namespaced name, e.g. `{server}_{tool}`.
+        arguments: The validated arguments about to be sent. Read-only.
+        tool_call_id: The id of the LangChain `ToolCall` that triggered this
+            invocation, or `None` when the tool was invoked with plain arguments
+            rather than a `ToolCall`. Inside an agent it is set for every call,
+            is distinct for parallel calls, and is the same when a call is
+            re-run, e.g. when an interrupted call resumes.
+        config: The `RunnableConfig` the tool runs under, including
+            `configurable` values set on the run.
+    """
+
+    tool_name: str
+    arguments: Mapping[str, Any]
+    tool_call_id: str | None
+    config: RunnableConfig
+
+
+MCPCallMeta: TypeAlias = Callable[
+    [MCPToolInvocation],
+    Mapping[str, Any] | Awaitable[Mapping[str, Any] | None] | None,
+]
+"""A hook returning the request `_meta` to send with one MCP `tools/call`.
+
+Sync or async. Returning `None` (or an empty mapping) sends no extra `_meta`.
+"""
+
+
+_CURRENT_TOOL_CALL_ID: ContextVar[str | None] = ContextVar(
+    "langchain_mcp_current_tool_call_id", default=None
+)
+"""The `ToolCall` id of the MCP tool invocation running in this context.
+
+`BaseTool` validates a JSON-schema tool's arguments but does not hand the tool
+call id to its coroutine, and a reserved coroutine parameter could collide with
+an argument the server defines. `_MCPTool.arun` records it here instead, scoped
+to the one invocation.
+"""
+
+
+class _MCPTool(StructuredTool):
+    """A `StructuredTool` that exposes its current tool call id to `call_meta`."""
+
+    async def arun(
+        self,
+        tool_input: str | dict[str, Any],
+        *args: Any,
+        tool_call_id: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Run the tool with `tool_call_id` visible to this invocation only."""
+        token = _CURRENT_TOOL_CALL_ID.set(tool_call_id)
+        try:
+            return await super().arun(tool_input, *args, tool_call_id=tool_call_id, **kwargs)
+        finally:
+            _CURRENT_TOOL_CALL_ID.reset(token)
+
+
+async def _resolve_call_meta(
+    call_meta: MCPCallMeta, tool_name: str, arguments: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Run the `call_meta` hook for one invocation and validate what it returns."""
+    invocation = MCPToolInvocation(
+        tool_name=tool_name,
+        arguments=MappingProxyType(arguments),
+        tool_call_id=_CURRENT_TOOL_CALL_ID.get(),
+        # Inside a tool run this is the tool's own child config.
+        config=ensure_config(),
+    )
+    meta = call_meta(invocation)
+    if inspect.isawaitable(meta):
+        meta = await meta
+    if meta is None:
+        return None
+    if not isinstance(meta, Mapping):
+        # Unreachable for a hook that matches `MCPCallMeta`, but hooks are often
+        # untyped lambdas, and a named error beats a failure deep in the client.
+        msg = (  # type: ignore[unreachable]
+            f"`call_meta` must return a mapping or None for the MCP tool {tool_name!r}, "
+            f"got {type(meta).__name__}."
+        )
+        raise TypeError(msg)
+    return dict(meta) if meta else None
 
 
 def _summarize_tool_error(tool_content: list[ToolMessageContentBlock]) -> str:
@@ -234,6 +330,8 @@ def _normalize_mcp_schema(schema: dict[str, Any]) -> dict[str, Any]:
 async def as_langchain_tool(
     tool: Tool,
     client: Client[Any] | ClientGroup,
+    *,
+    call_meta: MCPCallMeta | None = None,
 ) -> BaseTool:
     """Convert one MCP tool into a LangChain tool.
 
@@ -254,9 +352,21 @@ async def as_langchain_tool(
     content, so an agent can correct itself and retry. Transport failures and
     unconvertible content propagate instead, since a model cannot act on them.
 
+    `call_meta` attaches request `_meta` to each `tools/call`, for metadata a
+    server needs that is not part of the tool's arguments, so the model never
+    sees or fills it in: an idempotency key so a retried call is not run twice,
+    a distinct id for each of several parallel calls, or a request, tenant or
+    trace id for the run. The hook is called once per invocation,
+    before the request is sent, with an `MCPToolInvocation`. Because it receives
+    the LangChain tool call id, it can derive a value that is distinct per call
+    and stable when the same call is retried or resumed. Its `_meta` is sent on
+    every round of an interrupt-driven call.
+
     Args:
         tool: An MCP tool, as returned by `fastmcp.Client.list_tools`.
         client: The FastMCP client to call the tool through.
+        call_meta: Optional hook returning the request `_meta` to send with each
+            call. Sync or async. `None` (the default) sends no extra `_meta`.
 
     Returns:
         A LangChain tool that invokes the MCP tool asynchronously.
@@ -272,6 +382,23 @@ async def as_langchain_tool(
             mcp_tools = await client.list_tools()
         tools = [await as_langchain_tool(t, client) for t in mcp_tools]
         ```
+
+        Sending a per-call idempotency key, and a run-wide value read from
+        `configurable`:
+
+        ```python
+        from langchain.mcp import MCPToolInvocation
+
+
+        def call_meta(call: MCPToolInvocation) -> dict[str, str]:
+            meta = {"com.example/tenant": call.config["configurable"]["tenant"]}
+            if call.tool_call_id is not None:
+                meta["com.example/idempotency-key"] = call.tool_call_id
+            return meta
+
+
+        tools = [await as_langchain_tool(t, client, call_meta=call_meta) for t in mcp_tools]
+        ```
     """
     if isinstance(client, ClientGroup):
         tool_route = await client.resolve_tool(tool.name)
@@ -284,16 +411,23 @@ async def as_langchain_tool(
         **arguments: Any,
     ) -> tuple[list[ToolMessageContentBlock], MCPToolArtifact | None]:
         """Call the captured MCP tool and convert its result."""
+        meta = (
+            await _resolve_call_meta(call_meta, tool.name, arguments)
+            if call_meta is not None
+            else None
+        )
         result: _ToolCallResult
         async with client:
             if drives_interrupts:
-                result = await _call_tool_with_interrupts(client, tool.name, arguments)
+                result = await _call_tool_with_interrupts(client, tool.name, arguments, meta=meta)
             else:
                 # Preserve MCP error results for conversion into failed tool messages.
-                result = await client.call_tool(tool.name, arguments, raise_on_error=False)
+                result = await client.call_tool(
+                    tool.name, arguments, raise_on_error=False, meta=meta
+                )
         return _convert_call_tool_result(result)
 
-    return StructuredTool(
+    return _MCPTool(
         name=tool.name,
         description=tool.description or "",
         args_schema=_normalize_mcp_schema(tool.input_schema),
@@ -304,4 +438,4 @@ async def as_langchain_tool(
     )
 
 
-__all__ = ["MCPToolArtifact", "as_langchain_tool"]
+__all__ = ["MCPCallMeta", "MCPToolArtifact", "MCPToolInvocation", "as_langchain_tool"]

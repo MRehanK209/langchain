@@ -17,7 +17,12 @@ import warnings
 from langchain_core._api import LangChainBetaWarning, beta_decorator
 
 from langchain.mcp.adapter import MCPAdapter
-from langchain.mcp.tools import MCPToolArtifact, as_langchain_tool
+from langchain.mcp.tools import (
+    MCPCallMeta,
+    MCPToolArtifact,
+    MCPToolInvocation,
+    as_langchain_tool,
+)
 
 # Warned on import rather than through `@beta`, which annotates a function or
 # class and so only fires once something is called. The status belongs to the
@@ -33,6 +38,8 @@ if _suppression is None or not _suppression.get():
 
 __all__ = [
     "MCPAdapter",
+    "MCPCallMeta",
     "MCPToolArtifact",
+    "MCPToolInvocation",
     "as_langchain_tool",
 ]

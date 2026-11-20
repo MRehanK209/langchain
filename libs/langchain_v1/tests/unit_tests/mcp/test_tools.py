@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Literal, cast
 from unittest.mock import AsyncMock
 
 import pytest
-from fastmcp import Client, FastMCP
+from fastmcp import Client, Context, FastMCP
 from fastmcp.client.client import CallToolResult
 from fastmcp.exceptions import ToolError
 from mcp.types import (
@@ -21,9 +22,13 @@ from mcp.types import (
     ToolAnnotations,
 )
 
-from langchain.mcp import as_langchain_tool
+from langchain.mcp import MCPCallMeta, MCPToolInvocation, as_langchain_tool
 from langchain.mcp.elicitation import _arm_for_interrupts
-from langchain.mcp.tools import _convert_call_tool_result, _convert_content_block
+from langchain.mcp.tools import (
+    _CURRENT_TOOL_CALL_ID,
+    _convert_call_tool_result,
+    _convert_content_block,
+)
 
 
 class _VideoContent:
@@ -43,6 +48,7 @@ async def _one_tool(
     server: FastMCP[None],
     *,
     elicitation: Literal["interrupt"] | None = None,
+    call_meta: MCPCallMeta | None = None,
 ) -> tuple[Any, Client[Any]]:
     """Convert the single tool an in-process server exposes.
 
@@ -54,7 +60,41 @@ async def _one_tool(
         _arm_for_interrupts(client)
     async with client:
         [mcp_tool] = await client.list_tools()
-    return await as_langchain_tool(mcp_tool, client), client
+    return await as_langchain_tool(mcp_tool, client, call_meta=call_meta), client
+
+
+_EXAMPLE_META_PREFIX = "com.example/"
+"""Prefix of the `_meta` keys these tests send.
+
+A server also sees protocol-owned `io.modelcontextprotocol/*` keys and a
+`progressToken` on every request, so tests compare only their own keys.
+"""
+
+
+def _meta_echo_server() -> FastMCP[None]:
+    """A server whose one tool reports the request `_meta` it was sent."""
+    server: FastMCP[None] = FastMCP("echo")
+
+    @server.tool
+    def echo(text: str, ctx: Context) -> dict[str, Any]:
+        """Report the `text` argument and the request's own `_meta`."""
+        assert ctx.request_context is not None
+        meta = ctx.request_context.meta or {}
+        sent = {key: value for key, value in meta.items() if key.startswith(_EXAMPLE_META_PREFIX)}
+        return {"text": text, "meta": sent}
+
+    return server
+
+
+def _echo_call(call_id: str, text: str = "from the model") -> dict[str, Any]:
+    return {"name": "echo", "args": {"text": text}, "id": call_id, "type": "tool_call"}
+
+
+def _id_and_name(call: MCPToolInvocation) -> dict[str, Any]:
+    return {
+        "com.example/call-id": call.tool_call_id,
+        "com.example/tool": call.tool_name,
+    }
 
 
 @pytest.mark.asyncio
@@ -307,3 +347,101 @@ def test_an_unknown_embedded_resource_type_names_itself() -> None:
 
     with pytest.raises(ValueError, match="Unknown embedded resource type: _VideoResource"):
         _convert_content_block(embedded)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elicitation", [None, "interrupt"], ids=["fastmcp", "interrupt"])
+async def test_call_meta_is_sent_as_request_meta(
+    elicitation: Literal["interrupt"] | None,
+) -> None:
+    tool, _ = await _one_tool(_meta_echo_server(), elicitation=elicitation, call_meta=_id_and_name)
+
+    message = await tool.ainvoke(_echo_call("call-1"))
+
+    assert message.artifact == {
+        "structured_content": {
+            # The model's own arguments are untouched by the hook.
+            "text": "from the model",
+            "meta": {"com.example/call-id": "call-1", "com.example/tool": "echo"},
+        }
+    }
+    assert _CURRENT_TOOL_CALL_ID.get() is None
+
+
+@pytest.mark.asyncio
+async def test_parallel_calls_each_send_their_own_tool_call_id() -> None:
+    tool, _ = await _one_tool(_meta_echo_server(), call_meta=_id_and_name)
+
+    messages = await asyncio.gather(*(tool.ainvoke(_echo_call(f"call-{i}")) for i in range(5)))
+
+    for message in messages:
+        sent = message.artifact["structured_content"]["meta"]
+        assert sent["com.example/call-id"] == message.tool_call_id
+
+
+@pytest.mark.asyncio
+async def test_call_meta_reads_the_run_configuration() -> None:
+    def tenant(call: MCPToolInvocation) -> dict[str, Any]:
+        return {"com.example/tenant": call.config["configurable"]["tenant"]}
+
+    tool, _ = await _one_tool(_meta_echo_server(), call_meta=tenant)
+
+    message = await tool.ainvoke(_echo_call("call-1"), {"configurable": {"tenant": "acme"}})
+
+    assert message.artifact["structured_content"]["meta"] == {"com.example/tenant": "acme"}
+
+
+@pytest.mark.asyncio
+async def test_an_async_call_meta_is_awaited() -> None:
+    async def call_id(call: MCPToolInvocation) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        return {"com.example/call-id": call.tool_call_id}
+
+    tool, _ = await _one_tool(_meta_echo_server(), call_meta=call_id)
+
+    message = await tool.ainvoke(_echo_call("call-1"))
+
+    assert message.artifact["structured_content"]["meta"] == {"com.example/call-id": "call-1"}
+
+
+@pytest.mark.asyncio
+async def test_without_a_tool_call_the_hook_sees_no_id_and_read_only_arguments() -> None:
+    seen: list[MCPToolInvocation] = []
+
+    def record(call: MCPToolInvocation) -> None:
+        seen.append(call)
+
+    tool, _ = await _one_tool(_meta_echo_server(), call_meta=record)
+
+    await tool.ainvoke({"text": "plain"})
+
+    [call] = seen
+    assert call.tool_call_id is None
+    assert call.arguments == {"text": "plain"}
+    with pytest.raises(TypeError):
+        call.arguments["text"] = "changed"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call_meta",
+    [None, lambda _call: None, lambda _call: {}],
+    ids=["no-hook", "returns-none", "returns-empty"],
+)
+async def test_no_meta_sends_nothing_extra(call_meta: MCPCallMeta | None) -> None:
+    tool, _ = await _one_tool(_meta_echo_server(), call_meta=call_meta)
+
+    message = await tool.ainvoke(_echo_call("call-1"))
+
+    assert message.artifact["structured_content"]["meta"] == {}
+
+
+@pytest.mark.asyncio
+async def test_a_hook_returning_a_non_mapping_is_refused() -> None:
+    tool, _ = await _one_tool(
+        _meta_echo_server(),
+        call_meta=cast("MCPCallMeta", lambda _call: ["not", "a", "mapping"]),
+    )
+
+    with pytest.raises(TypeError, match="must return a mapping or None"):
+        await tool.ainvoke(_echo_call("call-1"))
