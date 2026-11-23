@@ -101,6 +101,25 @@ class _MCPToolExecutionError(ToolException):
         self.tool_content = tool_content
 
 
+class _MCPStructuredTool(StructuredTool):
+    """A `StructuredTool` that hands the MCP coroutine exactly the model's arguments.
+
+    `BaseTool.arun` adds `config` and `run_manager` to a tool's keyword arguments
+    when its `_arun` declares them, as `StructuredTool._arun` does, and they then
+    replace any tool argument of the same name. For a hand-written tool those
+    names are documented as reserved. An MCP tool's argument names belong to the
+    server, so a caller cannot avoid them. Declaring neither here means nothing
+    is injected, and every argument name reaches the server unchanged.
+    """
+
+    async def _arun(self, *args: Any, **kwargs: Any) -> Any:
+        """Call the MCP coroutine with the validated tool arguments only."""
+        if self.coroutine is None:
+            # `as_langchain_tool` always sets one; kept for the base-class contract.
+            return await super()._arun(*args, **kwargs)
+        return await self.coroutine(*args, **kwargs)
+
+
 def _handle_mcp_tool_error(error: ToolException) -> list[ToolMessageContentBlock]:
     """Surface an MCP execution error to the model as failed tool output.
 
@@ -293,7 +312,7 @@ async def as_langchain_tool(
                 result = await client.call_tool(tool.name, arguments, raise_on_error=False)
         return _convert_call_tool_result(result)
 
-    return StructuredTool(
+    return _MCPStructuredTool(
         name=tool.name,
         description=tool.description or "",
         args_schema=_normalize_mcp_schema(tool.input_schema),

@@ -180,6 +180,79 @@ async def test_annotations_and_meta_are_kept_under_the_mcp_namespace() -> None:
     }
 
 
+_RUN_CONTROL_NAMES = (
+    "config",
+    "run_manager",
+    "callbacks",
+    "metadata",
+    "tags",
+    "run_name",
+    "run_id",
+    "tool_call_id",
+    "verbose",
+    "color",
+    "args",
+    "kwargs",
+)
+"""Names LangChain's tool machinery uses for its own run controls.
+
+Only `config` and `run_manager` were ever consumed, but checking all of them
+catches a future core change that starts consuming another.
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elicitation", [None, "interrupt"], ids=["fastmcp", "interrupt"])
+async def test_arguments_named_like_run_controls_reach_the_server(
+    elicitation: Literal["interrupt"] | None,
+) -> None:
+    """The server owns an MCP tool's argument names, so none may be consumed."""
+    server: FastMCP[None] = FastMCP("controls")
+
+    @server.tool
+    def echo(
+        config: str,
+        run_manager: str,
+        callbacks: str,
+        metadata: str,
+        tags: str,
+        run_name: str,
+        run_id: str,
+        tool_call_id: str,
+        verbose: str,
+        color: str,
+        args: str,
+        kwargs: str,
+    ) -> dict[str, str]:
+        """Return every argument the server received."""
+        return {
+            "config": config,
+            "run_manager": run_manager,
+            "callbacks": callbacks,
+            "metadata": metadata,
+            "tags": tags,
+            "run_name": run_name,
+            "run_id": run_id,
+            "tool_call_id": tool_call_id,
+            "verbose": verbose,
+            "color": color,
+            "args": args,
+            "kwargs": kwargs,
+        }
+
+    tool, _ = await _one_tool(server, elicitation=elicitation)
+    sent = {name: f"model-{name}" for name in _RUN_CONTROL_NAMES}
+
+    message = await tool.ainvoke(
+        {"name": "echo", "args": sent, "id": "call-1", "type": "tool_call"},
+        # Real run controls set alongside, so each name is in play on both sides.
+        {"tags": ["run-tag"], "metadata": {"run": "meta"}, "run_name": "run"},
+    )
+
+    assert message.status == "success"
+    assert message.artifact == {"structured_content": sent}
+
+
 @pytest.mark.asyncio
 async def test_tool_without_annotations_or_meta_has_no_metadata() -> None:
     mcp_tool = Tool(name="noop", inputSchema={"type": "object", "properties": {}})
